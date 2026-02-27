@@ -3,3 +3,5 @@ __pycache__/
 .pycache/
 .env
 termite_process_config.json
+*.lock
+*.tmp

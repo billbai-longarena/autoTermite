@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import threading
 import tkinter as tk
 from tkinter import messagebox
 from tkinter import ttk
@@ -20,6 +21,14 @@ from termite_process_utils import (
 
 REFRESH_INTERVAL_MS = 3000
 
+TASK_TYPE_OPTIONS = [
+    "审计",
+    "基于网络的客户需求研究和市场研究并形成开发需求",
+    "AB测试和转化漏斗设计",
+    "自主根据任务优先级选择",
+    "你是自由的",
+]
+
 
 class TermiteControlGUI(tk.Tk):
     def __init__(self) -> None:
@@ -34,15 +43,23 @@ class TermiteControlGUI(tk.Tk):
         self.active_by_key = {}
         self.orphan_by_pid = {}
         self.selected_process_key = None
+        self._refresh_in_progress = False  # 3A: prevent overlapping background refreshes
 
         self.auto_refresh_var = tk.BooleanVar(value=True)
         self.enable_agent_team_var = tk.BooleanVar(value=DEFAULT_PROCESS_CONFIG["enable_agent_team"])
         self.automate_process_var = tk.BooleanVar(value=DEFAULT_PROCESS_CONFIG["automate_process"])
         self.new_chat_on_done_var = tk.BooleanVar(value=DEFAULT_PROCESS_CONFIG["new_chat_on_done"])
+        self.max_tasks_var = tk.StringVar(value=str(DEFAULT_PROCESS_CONFIG["max_tasks"]))
 
         self.selected_process_text = tk.StringVar(value="Selected: <none>")
         self.status_text = tk.StringVar(value=f"Config file: {self.config_path}")
         self.global_pause_var = tk.BooleanVar(value=False)
+
+        self.task_type_vars = {}
+        self.task_weight_vars = {}
+        for option in TASK_TYPE_OPTIONS:
+            self.task_type_vars[option] = tk.BooleanVar(value=False)
+            self.task_weight_vars[option] = tk.StringVar(value="10")
 
         self._build_layout()
         self.refresh_all()
@@ -109,6 +126,7 @@ class TermiteControlGUI(tk.Tk):
             "state",
             "agent_team",
             "new_chat",
+            "progress",
             "args",
         )
 
@@ -121,6 +139,7 @@ class TermiteControlGUI(tk.Tk):
         self.active_tree.heading("state", text="State")
         self.active_tree.heading("agent_team", text="Agent Team")
         self.active_tree.heading("new_chat", text="New Chat On Done")
+        self.active_tree.heading("progress", text="Progress")
         self.active_tree.heading("args", text="Command")
 
         self.active_tree.column("automate", width=60, anchor=tk.CENTER)
@@ -131,6 +150,7 @@ class TermiteControlGUI(tk.Tk):
         self.active_tree.column("state", width=80, anchor=tk.CENTER)
         self.active_tree.column("agent_team", width=100, anchor=tk.CENTER)
         self.active_tree.column("new_chat", width=130, anchor=tk.CENTER)
+        self.active_tree.column("progress", width=100, anchor=tk.CENTER)
         self.active_tree.column("args", width=480, anchor=tk.W)
 
         y_scroll = ttk.Scrollbar(wrapper, orient=tk.VERTICAL, command=self.active_tree.yview)
@@ -160,6 +180,33 @@ class TermiteControlGUI(tk.Tk):
             text="Start /new when task is done",
             variable=self.new_chat_on_done_var,
         ).pack(anchor=tk.W, padx=12, pady=4)
+
+        # Task Types Section
+        types_frame = ttk.LabelFrame(wrapper, text="Task Types & Weights")
+        types_frame.pack(fill=tk.X, padx=12, pady=8)
+        
+        for option in TASK_TYPE_OPTIONS:
+            row = ttk.Frame(types_frame)
+            row.pack(fill=tk.X, padx=8, pady=2)
+            
+            cb = ttk.Checkbutton(
+                row,
+                text=option,
+                variable=self.task_type_vars[option],
+            )
+            cb.pack(side=tk.LEFT, anchor=tk.W)
+            
+            # Weight entry
+            ttk.Label(row, text="Wt:").pack(side=tk.RIGHT, padx=(4, 0))
+            entry = ttk.Entry(row, textvariable=self.task_weight_vars[option], width=4)
+            entry.pack(side=tk.RIGHT)
+
+        task_frame = ttk.Frame(wrapper)
+        task_frame.pack(fill=tk.X, padx=12, pady=4)
+        ttk.Label(task_frame, text="Max Tasks (0=unlimited):").pack(side=tk.LEFT)
+        self.max_tasks_entry = ttk.Entry(task_frame, textvariable=self.max_tasks_var, width=10)
+        self.max_tasks_entry.pack(side=tk.LEFT, padx=(8, 0))
+        ttk.Button(task_frame, text="Reset Count", command=self._reset_task_count).pack(side=tk.LEFT, padx=(12, 0))
 
         button_row = ttk.Frame(wrapper)
         button_row.pack(fill=tk.X, padx=12, pady=(14, 8))
@@ -223,7 +270,7 @@ class TermiteControlGUI(tk.Tk):
 
     def _auto_refresh_tick(self) -> None:
         if self.auto_refresh_var.get():
-            self.refresh_all()
+            self.refresh_all(update_inputs=False)
         self.after(REFRESH_INTERVAL_MS, self._auto_refresh_tick)
 
     def _toggle_global_pause(self) -> None:
@@ -244,74 +291,143 @@ class TermiteControlGUI(tk.Tk):
         else:
             self.btn_toggle_pause.config(text="⏸ Pause Daemon")
 
-    def refresh_all(self) -> None:
-        prev_selected_key = self.selected_process_key
-        self.config_data = load_process_config(self.config_path)
-        self._update_pause_button_state()
+    def refresh_all(self, update_inputs: bool = True) -> None:
+        """3A: Run I/O (config load + process scan) in a background thread,
+        then apply results on the main thread via self.after()."""
+        if self._refresh_in_progress:
+            return
+        self._refresh_in_progress = True
 
-        active = find_active_agent_processes()
-        orphans = find_orphan_agent_processes()
+        def _background_io():
+            try:
+                config_data = load_process_config(self.config_path)
+                active = find_active_agent_processes()
+                orphans = find_orphan_agent_processes()
+            except Exception:
+                config_data = {"processes": {}, "global_pause": False}
+                active = []
+                orphans = []
+            self.after(0, lambda: self._apply_refresh_results(config_data, active, orphans, update_inputs))
 
-        self.active_by_key = {proc["process_key"]: proc for proc in active}
-        self.orphan_by_pid = {proc["pid"]: proc for proc in orphans}
+        t = threading.Thread(target=_background_io, daemon=True)
+        t.start()
 
-        self._render_active_tree(active)
-        self._render_orphan_tree(orphans)
+    def _apply_refresh_results(self, config_data: dict, active: list, orphans: list, update_inputs: bool) -> None:
+        """Apply refresh results on the main (Tk) thread."""
+        self._refresh_in_progress = False
 
-        if prev_selected_key and prev_selected_key in self.active_by_key:
-            self._select_active_row(prev_selected_key)
-        else:
-            self.selected_process_key = None
-            self.selected_process_text.set("Selected: <none>")
-            self._update_process_pause_btn_state()
+        # Unbind to prevent spurious selection events during update
+        self.active_tree.unbind("<<TreeviewSelect>>")
 
-        status_suffix = " [PAUSED]" if self.config_data.get("global_pause", False) else ""
-        self.status_text.set(
-            f"Config file: {self.config_path} | active={len(active)} | orphan={len(orphans)}{status_suffix}"
-        )
+        try:
+            prev_selected_key = self.selected_process_key
+            self.config_data = config_data
+            self._update_pause_button_state()
+
+            self.active_by_key = {proc["process_key"]: proc for proc in active}
+            self.orphan_by_pid = {proc["pid"]: proc for proc in orphans}
+
+            self._render_active_tree(active)
+            self._render_orphan_tree(orphans)
+
+            if prev_selected_key and prev_selected_key in self.active_by_key:
+                # Re-select the row to keep highlight
+                if prev_selected_key not in self.active_tree.get_children():
+                    return
+
+                # Check if selection is already correct to avoid triggering event unnecessarily
+                current_selection = self.active_tree.selection()
+                if not current_selection or current_selection[0] != prev_selected_key:
+                    self.active_tree.selection_set(prev_selected_key)
+                    self.active_tree.focus(prev_selected_key)
+
+                # Only update inputs if explicitly requested (manual refresh or selection change)
+                if update_inputs:
+                    self._load_selected_config(prev_selected_key)
+            else:
+                self.selected_process_key = None
+                self.selected_process_text.set("Selected: <none>")
+                self._update_process_pause_btn_state()
+
+            status_suffix = " [PAUSED]" if self.config_data.get("global_pause", False) else ""
+            self.status_text.set(
+                f"Config file: {self.config_path} | active={len(active)} | orphan={len(orphans)}{status_suffix}"
+            )
+        finally:
+            # Re-bind
+            self.active_tree.bind("<<TreeviewSelect>>", self._on_active_selected)
 
     def _render_active_tree(self, processes: list[dict]) -> None:
-        for item in self.active_tree.get_children():
-            self.active_tree.delete(item)
+        existing_iids = set(self.active_tree.get_children())
+        seen_iids = set()
 
         for proc in processes:
             cfg = get_effective_process_config(self.config_data, proc["process_key"])
-            self.active_tree.insert(
-                "",
-                tk.END,
-                iid=proc["process_key"],
-                values=(
-                    "🟢" if cfg["automate_process"] else "⚪",
-                    proc["process_key"],
-                    proc["type"],
-                    proc["pid"],
-                    proc["tty"],
-                    proc["state"],
-                    "on" if cfg["enable_agent_team"] else "off",
-                    "on" if cfg["new_chat_on_done"] else "off",
-                    proc["args"],
-                ),
+            max_tasks = cfg.get("max_tasks", 0)
+            completed = cfg.get("completed_tasks", 0)
+            session_completed = cfg.get("session_completed_tasks", 0)
+            progress_str = f"S:{session_completed}/{max_tasks if max_tasks > 0 else '∞'} | T:{completed}"
+            
+            iid = proc["process_key"]
+            seen_iids.add(iid)
+            
+            values = (
+                "🟢" if cfg["automate_process"] else "⚪",
+                proc["process_key"],
+                proc["type"],
+                proc["pid"],
+                proc["tty"],
+                proc["state"],
+                "on" if cfg["enable_agent_team"] else "off",
+                "on" if cfg["new_chat_on_done"] else "off",
+                progress_str,
+                proc["args"],
             )
 
+            if self.active_tree.exists(iid):
+                self.active_tree.item(iid, values=values)
+            else:
+                self.active_tree.insert(
+                    "",
+                    tk.END,
+                    iid=iid,
+                    values=values,
+                )
+        
+        # Remove items that are no longer active
+        for iid in existing_iids - seen_iids:
+            self.active_tree.delete(iid)
+
     def _render_orphan_tree(self, processes: list[dict]) -> None:
-        for item in self.orphan_tree.get_children():
-            self.orphan_tree.delete(item)
+        existing_iids = set(self.orphan_tree.get_children())
+        seen_iids = set()
 
         for proc in processes:
             orphan_iid = f"orphan:{proc['pid']}"
-            self.orphan_tree.insert(
-                "",
-                tk.END,
-                iid=orphan_iid,
-                values=(
-                    proc["pid"],
-                    proc["type"],
-                    proc["tty"],
-                    proc["ppid"],
-                    proc["state"],
-                    proc["args"],
-                ),
+            seen_iids.add(orphan_iid)
+            
+            values = (
+                proc["pid"],
+                proc["type"],
+                proc["tty"],
+                proc["ppid"],
+                proc["state"],
+                proc["args"],
             )
+
+            if self.orphan_tree.exists(orphan_iid):
+                self.orphan_tree.item(orphan_iid, values=values)
+            else:
+                self.orphan_tree.insert(
+                    "",
+                    tk.END,
+                    iid=orphan_iid,
+                    values=values,
+                )
+        
+        # Remove items that are no longer active
+        for iid in existing_iids - seen_iids:
+            self.orphan_tree.delete(iid)
 
     def _select_active_row(self, process_key: str) -> None:
         if process_key not in self.active_tree.get_children():
@@ -344,6 +460,24 @@ class TermiteControlGUI(tk.Tk):
         self.enable_agent_team_var.set(cfg["enable_agent_team"])
         self.automate_process_var.set(cfg["automate_process"])
         self.new_chat_on_done_var.set(cfg["new_chat_on_done"])
+
+        current_types = set(cfg.get("task_types", []))
+        current_weights = cfg.get("task_weights", {})
+        
+        for option, var in self.task_type_vars.items():
+            var.set(option in current_types)
+            
+            # Load weight, default to 10
+            weight = current_weights.get(option, 10)
+            self.task_weight_vars[option].set(str(weight))
+
+        # Only update text entry if it doesn't have focus (user might be typing)
+        # This prevents the refresh loop from overwriting user input
+        try:
+            if self.focus_get() != self.max_tasks_entry:
+                self.max_tasks_var.set(str(cfg.get("max_tasks", 0)))
+        except Exception:
+            self.max_tasks_var.set(str(cfg.get("max_tasks", 0)))
         
         self._update_process_pause_btn_state()
 
@@ -374,11 +508,43 @@ class TermiteControlGUI(tk.Tk):
             messagebox.showwarning("No selection", "Please select an active process first.")
             return
 
+        try:
+            max_tasks_val = int(self.max_tasks_var.get())
+            if max_tasks_val < 0:
+                raise ValueError("Cannot be negative")
+        except ValueError:
+            messagebox.showerror("Invalid Input", "Max Tasks must be a non-negative integer.")
+            return
+
+        # Preserve existing completed_tasks count
+        existing_cfg = self.config_data.get("processes", {}).get(self.selected_process_key, {})
+        current_completed = existing_cfg.get("completed_tasks", 0)
+        current_session_completed = existing_cfg.get("session_completed_tasks", 0)
+
+        selected_types = []
+        task_weights = {}
+        
+        for opt, var in self.task_type_vars.items():
+            if var.get():
+                selected_types.append(opt)
+                # Parse weight
+                try:
+                    w_val = int(self.task_weight_vars[opt].get())
+                    if w_val < 0: w_val = 0
+                except ValueError:
+                    w_val = 10
+                task_weights[opt] = w_val
+
         processes = self.config_data.setdefault("processes", {})
         processes[self.selected_process_key] = {
             "enable_agent_team": self.enable_agent_team_var.get(),
             "automate_process": self.automate_process_var.get(),
             "new_chat_on_done": self.new_chat_on_done_var.get(),
+            "max_tasks": max_tasks_val,
+            "completed_tasks": current_completed,
+            "session_completed_tasks": current_session_completed,
+            "task_types": selected_types,
+            "task_weights": task_weights,
         }
 
         try:
@@ -390,6 +556,21 @@ class TermiteControlGUI(tk.Tk):
         self.refresh_all()
         messagebox.showinfo("Saved", f"Saved config for {self.selected_process_key}.")
 
+    def _reset_task_count(self) -> None:
+        if not self.selected_process_key:
+            messagebox.showwarning("No selection", "Please select an active process first.")
+            return
+            
+        if messagebox.askyesno("Confirm", "Reset SESSION task count to 0?"):
+            processes = self.config_data.setdefault("processes", {})
+            if self.selected_process_key in processes:
+                processes[self.selected_process_key]["session_completed_tasks"] = 0
+                try:
+                    save_process_config(self.config_data, self.config_path)
+                    self.refresh_all()
+                except Exception as exc:
+                    messagebox.showerror("Save Failed", f"Failed to save: {exc}")
+
     def _reset_selected_to_default(self) -> None:
         if not self.selected_process_key:
             messagebox.showwarning("No selection", "Please select an active process first.")
@@ -398,6 +579,12 @@ class TermiteControlGUI(tk.Tk):
         self.enable_agent_team_var.set(DEFAULT_PROCESS_CONFIG["enable_agent_team"])
         self.automate_process_var.set(DEFAULT_PROCESS_CONFIG["automate_process"])
         self.new_chat_on_done_var.set(DEFAULT_PROCESS_CONFIG["new_chat_on_done"])
+        self.max_tasks_var.set(str(DEFAULT_PROCESS_CONFIG["max_tasks"]))
+        
+        for var in self.task_type_vars.values():
+            var.set(False)
+        for var in self.task_weight_vars.values():
+            var.set("10")
 
         processes = self.config_data.setdefault("processes", {})
         processes[self.selected_process_key] = DEFAULT_PROCESS_CONFIG.copy()
