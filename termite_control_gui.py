@@ -27,6 +27,7 @@ TASK_TYPE_OPTIONS = [
     "AB测试和转化漏斗设计",
     "自主根据任务优先级选择",
     "你是自由的",
+    "白蚁协议",
 ]
 
 
@@ -638,6 +639,14 @@ class TermiteControlGUI(tk.Tk):
         ):
             return
 
+        # Run termination in background to avoid blocking GUI
+        threading.Thread(
+            target=self._close_orphans_background,
+            args=(pids, force),
+            daemon=True
+        ).start()
+
+    def _close_orphans_background(self, pids: list[int], force: bool) -> None:
         ok_count = 0
         failures = []
 
@@ -648,16 +657,20 @@ class TermiteControlGUI(tk.Tk):
             else:
                 failures.append(f"{pid}: {detail}")
 
+        # Schedule result handling on main thread
+        self.after(0, lambda: self._on_close_orphans_complete(ok_count, len(pids), failures))
+
+    def _on_close_orphans_complete(self, ok_count: int, total_count: int, failures: list[str]) -> None:
         self.refresh_all()
 
         if failures:
             detail_text = "\n".join(failures)
             messagebox.showwarning(
                 "Partial Result",
-                f"Succeeded: {ok_count}/{len(pids)}\nFailed:\n{detail_text}",
+                f"Succeeded: {ok_count}/{total_count}\nFailed:\n{detail_text}",
             )
         else:
-            messagebox.showinfo("Done", f"Succeeded: {ok_count}/{len(pids)}")
+            messagebox.showinfo("Done", f"Succeeded: {ok_count}/{total_count}")
 
 
 def main() -> None:
