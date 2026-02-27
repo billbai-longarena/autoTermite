@@ -53,6 +53,14 @@ def _atomic_write_json(path: str, data: dict) -> None:
     dir_name = os.path.dirname(os.path.abspath(path))
     fd, tmp_path = tempfile.mkstemp(dir=dir_name, suffix=".tmp")
     try:
+        # Preserve original file permissions so a root-created file stays
+        # readable by non-root users.  Default to 0644 for new files.
+        try:
+            orig_mode = os.stat(path).st_mode & 0o7777
+        except OSError:
+            orig_mode = 0o644
+        os.fchmod(fd, orig_mode)
+
         with os.fdopen(fd, "w", encoding="utf-8") as f:
             json.dump(data, f, ensure_ascii=False, indent=2)
             f.write("\n")
@@ -69,9 +77,24 @@ def _atomic_write_json(path: str, data: dict) -> None:
 
 @contextmanager
 def _file_lock(path: str, exclusive: bool = False):
-    """Acquire an advisory file lock (shared for reads, exclusive for writes)."""
+    """Acquire an advisory file lock (shared for reads, exclusive for writes).
+
+    The lock file may be owned by root (daemon) while the GUI runs as a
+    normal user.  We try O_RDWR|O_CREAT with 0666 first; if the file
+    already exists and is not writable, we fall back to read-only.
+    flock() works on read-only fds on both Linux and macOS.
+    """
     lock_path = path + ".lock"
-    lock_fd = open(lock_path, "a")
+    try:
+        fd = os.open(lock_path, os.O_RDWR | os.O_CREAT, 0o666)
+        try:
+            os.fchmod(fd, 0o666)  # override umask for cross-user access
+        except OSError:
+            pass
+        lock_fd = os.fdopen(fd, "r+")
+    except PermissionError:
+        # Lock file owned by another user; open read-only.
+        lock_fd = open(lock_path, "r")
     try:
         fcntl.flock(lock_fd, fcntl.LOCK_EX if exclusive else fcntl.LOCK_SH)
         yield
