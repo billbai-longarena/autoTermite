@@ -268,7 +268,8 @@ class TermiteControlGUI(tk.Tk):
         x_scroll.pack(side=tk.BOTTOM, fill=tk.X, padx=8, pady=(0, 6))
 
     def _show_config_file_location(self) -> None:
-        messagebox.showinfo("Config Path", self.config_path)
+        import subprocess
+        subprocess.Popen(["open", self.config_path])
 
     def _auto_refresh_tick(self) -> None:
         if self.auto_refresh_var.get():
