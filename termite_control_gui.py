@@ -44,6 +44,8 @@ class TermiteControlGUI(tk.Tk):
         self.orphan_by_pid = {}
         self.selected_process_key = None
         self._refresh_in_progress = False  # 3A: prevent overlapping background refreshes
+        self._refresh_result = None        # 3A: thread writes here, main thread polls
+        self._refresh_update_inputs = True
 
         self.auto_refresh_var = tk.BooleanVar(value=True)
         self.enable_agent_team_var = tk.BooleanVar(value=DEFAULT_PROCESS_CONFIG["enable_agent_team"])
@@ -292,11 +294,12 @@ class TermiteControlGUI(tk.Tk):
             self.btn_toggle_pause.config(text="⏸ Pause Daemon")
 
     def refresh_all(self, update_inputs: bool = True) -> None:
-        """3A: Run I/O (config load + process scan) in a background thread,
-        then apply results on the main thread via self.after()."""
+        """3A: Run I/O (config load + process scan) in a background thread.
+        Results are polled from the main thread — no cross-thread Tk calls."""
         if self._refresh_in_progress:
             return
         self._refresh_in_progress = True
+        self._refresh_update_inputs = update_inputs
 
         def _background_io():
             try:
@@ -307,10 +310,20 @@ class TermiteControlGUI(tk.Tk):
                 config_data = {"processes": {}, "global_pause": False}
                 active = []
                 orphans = []
-            self.after(0, lambda: self._apply_refresh_results(config_data, active, orphans, update_inputs))
+            self._refresh_result = (config_data, active, orphans)
 
-        t = threading.Thread(target=_background_io, daemon=True)
-        t.start()
+        threading.Thread(target=_background_io, daemon=True).start()
+        self._poll_refresh_result()
+
+    def _poll_refresh_result(self) -> None:
+        """Poll for background thread results (called on main thread only)."""
+        result = self._refresh_result
+        if result is not None:
+            self._refresh_result = None
+            config_data, active, orphans = result
+            self._apply_refresh_results(config_data, active, orphans, self._refresh_update_inputs)
+        else:
+            self.after(50, self._poll_refresh_result)
 
     def _apply_refresh_results(self, config_data: dict, active: list, orphans: list, update_inputs: bool) -> None:
         """Apply refresh results on the main (Tk) thread."""
