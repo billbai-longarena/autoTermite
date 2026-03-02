@@ -211,6 +211,10 @@ def call_claude(agent_name, screen_content, peer_context=None, override_prompt=N
         history_info += "注意：如果发现最近的几条指令是重复的且任务发生阻塞（没有任何进展），你需要保持随机应变，尝试发出不同角度或更明确的指导指令以打破僵局，而不是死板地重复同一句话。\n"
 
     task_focus_info = ""
+    has_strict_task_assignment = bool(
+        assigned_task
+        and assigned_task not in {"自主根据任务优先级选择", "你是自由的", "白蚁协议"}
+    )
     if assigned_task:
         task_focus_info = "\n\n=== CURRENT TASK ASSIGNMENT ===\n"
         if assigned_task == "自主根据任务优先级选择":
@@ -228,6 +232,16 @@ def call_claude(agent_name, screen_content, peer_context=None, override_prompt=N
         for tt in task_types:
             task_focus_info += f"- {tt}\n"
         task_focus_info += "===========================\n"
+
+    claude_normal_progression_text = (
+        f"`根据白蚁协议，本轮只执行【{assigned_task}】任务，禁止偏航。`\n\n"
+        if has_strict_task_assignment
+        else (
+            "`根据白蚁协议，选一个最重要的任务开始审计或设计（注意：在开始新任务前务必确保当前工作已提交。有条件push就要及时push。）`\n"
+            "     OR\n"
+            "     `根据白蚁协议，对已经完成的任务进行代码评审`\n\n"
+        )
+    )
 
     system_prompt = (
         "You are the Termite Daemon, an intelligent overseer (哨兵) for AI agents in a software engineering swarm. "
@@ -256,9 +270,7 @@ def call_claude(agent_name, screen_content, peer_context=None, override_prompt=N
         "   - **WORKLOAD PACING (CRITICAL)**: Maintain a lead of only 5-6 tasks over Codex. If Claude has > 6 unfinished designs/pending reviews, or if you feel it's moving too fast compared to Codex, output EXACTLY:\n"
         "     `[PAUSE]`\n"
         "   - **Normal Progression**: If Claude is idle and waiting for instructions (and not violating its role), drive it with:\n"
-        "     `根据白蚁协议，选一个最重要的任务开始审计或设计（注意：在开始新任务前务必确保当前工作已提交。有条件push就要及时push。）`\n"
-        "     OR\n"
-        "     `根据白蚁协议，对已经完成的任务进行代码评审`\n\n"
+        f"     {claude_normal_progression_text}"
         "=== INSTRUCTIONS ===\n"
         "Analyze the provided, cleaned terminal output.\n"
         "Determine the CURRENT STATE of the agent and provide the best next input string.\n"
@@ -417,6 +429,28 @@ def pick_weighted_task(task_types, task_weights):
         return random.choice(candidates)
 
     return random.choices(candidates, weights=weights, k=1)[0]
+
+
+def get_direct_task_instruction(agent_type, assigned_task):
+    """Return deterministic instruction for fixed task assignments."""
+    if not assigned_task:
+        return None
+
+    if assigned_task == "你是自由的":
+        return YOU_ARE_FREE_PROMPT
+    if assigned_task == "白蚁协议":
+        return "白蚁协议"
+
+    if agent_type != "claude":
+        return None
+
+    claude_fixed_task_prompts = {
+        "审计": "根据白蚁协议，你作为 Auditor/Architect 本轮只做【审计】任务：对已经完成的任务进行代码评审，输出问题清单（严重级别、定位、修复建议），不要切换到设计或实现。",
+        "基于网络的客户需求研究和市场研究并形成开发需求": "根据白蚁协议，你作为 Auditor/Architect 本轮只做【客户需求与市场研究】任务：基于可验证信息形成结构化开发需求（用户痛点、目标人群、优先级、验收标准），不要切换到代码实现。",
+        "AB测试和转化漏斗设计": "根据白蚁协议，你作为 Auditor/Architect 本轮只做【AB测试和转化漏斗设计】任务：输出实验假设、指标、样本策略和分阶段漏斗优化方案，不要切换到代码实现。",
+        "自主根据任务优先级选择": "根据白蚁协议，自主根据任务优先级选择一个最重要的【审计】或【设计】任务开始。",
+    }
+    return claude_fixed_task_prompts.get(assigned_task)
 
 
 def inject_input(tty, text):
@@ -732,11 +766,9 @@ def main():
                     log.info("action=ai_request agent=%s tty=%s wake_up=%s task=%s", atype, tty, is_waking_up, assigned_task or "General")
                     _runtime_event(process_key, "deciding", "ai_request", now_ts=now)
 
-                    if assigned_task == "你是自由的":
-                        decision = YOU_ARE_FREE_PROMPT
-                        log_ai_interaction(atype, content, f"[DIRECT] {decision}")
-                    elif assigned_task == "白蚁协议":
-                        decision = "白蚁协议"
+                    direct_decision = get_direct_task_instruction(atype, assigned_task)
+                    if direct_decision is not None:
+                        decision = direct_decision
                         log_ai_interaction(atype, content, f"[DIRECT] {decision}")
                     else:
                         decision = call_claude(
