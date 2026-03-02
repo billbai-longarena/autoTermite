@@ -253,7 +253,7 @@ situation=""
 # WIP context
 if [ "$wip" = "fresh" ] && [ -f "$WIP_FILE" ]; then
   # Extract first meaningful line from WIP
-  wip_summary=$(grep -m1 -E '^[^#]' "$WIP_FILE" 2>/dev/null | head -c 120 || echo "WIP exists")
+  wip_summary=$(grep -m1 -E '^[^#]' "$WIP_FILE" 2>/dev/null | cut -c -120 || echo "WIP exists")
   situation="${situation}WIP: \"${wip_summary}\"\n"
 fi
 
@@ -312,7 +312,7 @@ fi
 
 # Alarm context
 if [ "$alarm" = "true" ] && [ -f "$ALARM_FILE" ]; then
-  alarm_line=$(head -1 "$ALARM_FILE" | head -c 100)
+  alarm_line=$(head -1 "$ALARM_FILE" | cut -c -100)
   situation="${situation}ALARM: ${alarm_line}\n"
 fi
 
@@ -369,7 +369,7 @@ fi
 
 alarm_display="none"
 if [ "$alarm" = "true" ] && [ -f "$ALARM_FILE" ]; then
-  alarm_display=$(head -1 "$ALARM_FILE" 2>/dev/null | head -c 60)
+  alarm_display=$(head -1 "$ALARM_FILE" 2>/dev/null | cut -c -60)
   alarm_display="${alarm_display:-active}"
 fi
 

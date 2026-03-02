@@ -377,7 +377,8 @@ class TermiteControlGUI(tk.Tk):
         help_text = (
             "Agent Team: controls whether daemon sends peer context for this process.\n"
             "Automate: if disabled, daemon will ignore this process.\n"
-            "New Chat On Done: if disabled, daemon will block '/new' and continue in current chat.\n"
+            "New Chat On Done: if enabled, daemon first asks Haiku to judge whether task is truly done, then decides '/new'.\n"
+            "If disabled, daemon will block '/new' and continue in current chat.\n"
             "Task Types: daemon re-draws by weights on every automatic dispatch."
         )
         ttk.Label(content, text=help_text, justify=tk.LEFT, style="Muted.TLabel").pack(anchor=tk.W, padx=12, pady=(6, 12))

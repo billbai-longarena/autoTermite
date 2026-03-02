@@ -64,7 +64,7 @@ fi
 readme_desc=""
 for readme in README.md readme.md README.rst README.txt README; do
   if [ -f "${PROJECT_ROOT}/${readme}" ]; then
-    readme_desc=$(head -50 "${PROJECT_ROOT}/${readme}" 2>/dev/null | grep -v '^#' | grep -v '^$' | head -3 | tr '\n' ' ' | head -c 200)
+    readme_desc=$(head -50 "${PROJECT_ROOT}/${readme}" 2>/dev/null | grep -v '^#' | grep -v '^$' | head -3 | tr '\n' ' ' | cut -c -200)
     break
   fi
 done
@@ -126,9 +126,9 @@ fi
 # Derive title from README or project type
 explore_title=""
 if [ -n "$readme_desc" ]; then
-  explore_title="Map project: $(echo "$readme_desc" | head -c 60)"
+  explore_title="Map project: $(echo "$readme_desc" | cut -c -60)"
 elif [ -n "$git_summary" ]; then
-  explore_title="Map project: $(echo "$git_summary" | head -1 | head -c 60)"
+  explore_title="Map project: $(echo "$git_summary" | head -1 | cut -c -60)"
 else
   explore_title="Map ${project_type} project — verify build, test, document structure"
 fi

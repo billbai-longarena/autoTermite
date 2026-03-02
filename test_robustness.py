@@ -345,6 +345,61 @@ class TestPhase2B_TerminalContent(unittest.TestCase):
             td.agent_contexts.update(old_contexts)
 
 
+class TestPhase2D_HaikuCompletionJudge(unittest.TestCase):
+    """2D: completion gating must be judged by Haiku before normal task routing."""
+
+    def setUp(self):
+        import termite_daemon as td
+        self.td = td
+        self._saved_env = td.env_config.copy()
+        self._saved_hist = td.ai_decision_history.copy()
+        td.env_config["AZURE_ANTHROPIC_API_KEY"] = "test-key"
+        td.ai_decision_history.clear()
+        td.ai_decision_history["ttys001"] = ["根据白蚁协议，确认是否完成？"]
+
+    def tearDown(self):
+        self.td.env_config.clear()
+        self.td.env_config.update(self._saved_env)
+        self.td.ai_decision_history.clear()
+        self.td.ai_decision_history.update(self._saved_hist)
+
+    @patch("termite_daemon.log_ai_interaction")
+    @patch("termite_daemon._call_llm_with_retry")
+    def test_done_returns_true_and_uses_haiku_model(self, mock_call, _mock_log):
+        mock_call.return_value = {"content": [{"type": "text", "text": "DONE"}]}
+        result = self.td.should_start_new_chat_by_haiku(
+            "codex",
+            "结论：已完成。等待你分配新任务。",
+            assigned_task="修复登录问题",
+            tty="ttys001",
+        )
+        self.assertTrue(result)
+        self.assertTrue(mock_call.called)
+        payload = mock_call.call_args.args[1]
+        self.assertEqual(payload["model"], self.td.JUDGE_MODEL)
+
+    @patch("termite_daemon.log_ai_interaction")
+    @patch("termite_daemon._call_llm_with_retry")
+    def test_continue_returns_false(self, mock_call, _mock_log):
+        mock_call.return_value = {"content": [{"type": "text", "text": "CONTINUE"}]}
+        result = self.td.should_start_new_chat_by_haiku(
+            "codex",
+            "我在处理中，需要你确认选项 1 还是 2。",
+            tty="ttys001",
+        )
+        self.assertFalse(result)
+
+    @patch("termite_daemon._call_llm_with_retry")
+    def test_recent_new_short_circuits_without_llm_call(self, mock_call):
+        result = self.td.should_start_new_chat_by_haiku(
+            "codex",
+            "...\n/new\n>\n",
+            tty="ttys001",
+        )
+        self.assertFalse(result)
+        mock_call.assert_not_called()
+
+
 class TestPhase2C_TTYInjectionRetry(unittest.TestCase):
     """2C: inject_input retry logic — 3 attempts, sent_history only on success."""
 

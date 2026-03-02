@@ -264,6 +264,9 @@ def classify_agent_type(args: str) -> Optional[str]:
     if "codex" in args_lower:
         return "codex"
 
+    if "opencode" in args_lower:
+        return "opencode"
+
     if "claude" in args_lower:
         return "claude"
 

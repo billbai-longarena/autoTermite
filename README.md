@@ -4,7 +4,7 @@ An intelligent driver for orchestrating a software engineering swarm, primarily 
 
 ## 🎯 Original Requirements
 
-The goal is to create a "smart" daemon (`termite_daemon.py`) that replaces the simpler `codex_daemon.py`. This new daemon is powered by a cloud-based LLM (Claude Sonnet 4.6 via Azure) to make intelligent decisions based on the context of each agent's terminal.
+The goal is to create a "smart" daemon (`termite_daemon.py`) that replaces the simpler `codex_daemon.py`. This new daemon is powered by a cloud-based LLM (Claude Haiku 4.5 via Azure) to make intelligent decisions based on the context of each agent's terminal.
 
 ### Core Objectives
 1.  **Dual-Agent Orchestration**: Drive both `codex` and `claude code` simultaneously.
