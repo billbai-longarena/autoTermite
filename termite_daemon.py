@@ -33,12 +33,13 @@ import urllib.error
 from collections import deque
 from termite_process_utils import (
     CONFIG_FILE,
+    RUNTIME_STATUS_FILE,
     _safe_int,
     atomic_read_modify_write,
     find_active_agent_processes,
     get_effective_process_config,
     load_process_config,
-    save_process_config,
+    save_runtime_status,
 )
 
 # ── 配置 (defaults — overridable via daemon_settings in config JSON) ──
@@ -85,7 +86,7 @@ _metrics = {
     "decisions_failed": 0,
     "injections_succeeded": 0,
     "injections_failed": 0,
-    "tasks_completed": 0,
+    "signals_sent": 0,
     "pauses_triggered": 0,
 }
 
@@ -98,16 +99,16 @@ protocol_content = ""
 # 记录每个 agent(tty) 最近给出的最多 10 条指令，帮助 AI 理解进度
 ai_decision_history = {} # {tty: deque(maxlen=10)}
 
-# Track active task assignment per process key
-# { process_key: "Task Name" }
-active_task_assignment = {}
-# Track last known completed count to detect task completion events
+# Track last known signal count to detect count changes
 # { process_key: count }
 last_completed_counts = {}
 
 # Terminal content stability tracking (cross-cycle)
 _terminal_content_hashes = {}   # {tty: hash_of_last_terminal_tail}
 _content_stable_since = {}      # {tty: timestamp_when_content_first_stabilized}
+
+# Runtime snapshot for GUI observability
+_runtime_process_state = {}      # {process_key: {...}}
 
 # ── 初始化 ────────────────────────────────────────────────────────
 
@@ -441,7 +442,7 @@ def inject_input(tty, text):
 
 def _cleanup_stale_state(active_keys: set, active_ttys: set):
     """Remove state entries for processes that are no longer active."""
-    for d in (active_task_assignment, last_completed_counts):
+    for d in (last_completed_counts,):
         stale = [k for k in d if k not in active_keys]
         for k in stale:
             del d[k]
@@ -450,6 +451,54 @@ def _cleanup_stale_state(active_keys: set, active_ttys: set):
         stale = [k for k in d if k not in active_ttys]
         for k in stale:
             del d[k]
+    stale_runtime = [k for k in _runtime_process_state if k not in active_keys]
+    for k in stale_runtime:
+        del _runtime_process_state[k]
+
+
+def _runtime_mark(process_key, now_ts=None, **fields):
+    state = _runtime_process_state.setdefault(process_key, {})
+    if now_ts is None:
+        now_ts = time.time()
+    state.update(fields)
+    state["updated_at"] = now_ts
+
+
+def _runtime_event(process_key, status, event, now_ts=None, **fields):
+    if now_ts is None:
+        now_ts = time.time()
+    _runtime_mark(
+        process_key,
+        now_ts=now_ts,
+        status=status,
+        last_event=event,
+        last_event_ts=now_ts,
+        **fields,
+    )
+
+
+def _persist_runtime_snapshot(poll_interval, runtime_config, process_count, last_error=""):
+    now_ts = time.time()
+    daemon_state = {
+        "pid": os.getpid(),
+        "running": True,
+        "heartbeat_ts": now_ts,
+        "heartbeat": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(now_ts)),
+        "poll_interval": poll_interval,
+        "global_pause": bool(runtime_config.get("global_pause", False)) if isinstance(runtime_config, dict) else False,
+        "active_process_count": process_count,
+        "last_error": last_error or "",
+    }
+
+    snapshot = {
+        "daemon": daemon_state,
+        "metrics": dict(_metrics),
+        "processes": dict(_runtime_process_state),
+    }
+    try:
+        save_runtime_status(snapshot, RUNTIME_STATUS_FILE)
+    except Exception as exc:
+        log.debug("runtime status save failed: %s", exc)
 
 # ── 主循环 ────────────────────────────────────────────────────────
 
@@ -467,20 +516,42 @@ def main():
     log.info("进程配置: %s", CONFIG_FILE)
     log.info("Pacing: Claude lead max 6 tasks, pause %ds", PAUSE_DURATION)
 
+    poll_interval = POLL_INTERVAL
+    runtime_config = {"processes": {}, "global_pause": False, "daemon_settings": {}}
+
     def shutdown(sig, frame):
         log.info("正在退出...")
+        now_ts = time.time()
+        snapshot = {
+            "daemon": {
+                "pid": os.getpid(),
+                "running": False,
+                "heartbeat_ts": now_ts,
+                "heartbeat": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(now_ts)),
+                "poll_interval": poll_interval,
+                "global_pause": bool(runtime_config.get("global_pause", False)),
+                "active_process_count": 0,
+                "last_error": "terminated",
+            },
+            "metrics": dict(_metrics),
+            "processes": dict(_runtime_process_state),
+        }
+        try:
+            save_runtime_status(snapshot, RUNTIME_STATUS_FILE)
+        except Exception:
+            pass
         sys.exit(0)
+
     signal.signal(signal.SIGINT, shutdown)
     signal.signal(signal.SIGTERM, shutdown)
 
-    poll_interval = POLL_INTERVAL  # initialize before loop for safety
-
     while True:
+        loop_error = ""
+        processes = []
         try:
             _metrics["loop_count"] += 1
             now = time.time()
 
-            # 4D: Read daemon_settings for runtime-configurable parameters
             runtime_config = load_process_config(CONFIG_FILE)
             daemon_settings = runtime_config.get("daemon_settings", {})
             poll_interval = _safe_int(daemon_settings.get("poll_interval"), POLL_INTERVAL)
@@ -488,17 +559,11 @@ def main():
             pause_duration = _safe_int(daemon_settings.get("pause_duration"), PAUSE_DURATION)
             terminal_stable_min = _safe_int(daemon_settings.get("terminal_stable_min"), TERMINAL_STABLE_MIN)
 
-            # 清理冷却 (use runtime cooldown)
             to_del = [t for t, ts in sent_history.items() if now - ts > cooldown]
-            for t in to_del: del sent_history[t]
-
-            if runtime_config.get("global_pause", False):
-                time.sleep(poll_interval)
-                continue
+            for t in to_del:
+                del sent_history[t]
 
             processes = find_processes()
-
-            # 4A: Clean up stale state for exited processes
             active_keys = {p["process_key"] for p in processes}
             active_ttys = {p["tty"] for p in processes}
             _cleanup_stale_state(active_keys, active_ttys)
@@ -509,207 +574,285 @@ def main():
                 atype = proc["type"]
                 process_key = proc.get("process_key", f"{atype}:{tty}")
                 process_cfg = get_effective_process_config(runtime_config, process_key)
+                _runtime_mark(
+                    process_key,
+                    now_ts=now,
+                    tty=tty,
+                    pid=pid,
+                    type=atype,
+                    automate=bool(process_cfg.get("automate_process", False)),
+                    max_tasks=int(process_cfg.get("max_tasks", 0)),
+                    completed_tasks=int(process_cfg.get("completed_tasks", 0)),
+                    session_completed_tasks=int(process_cfg.get("session_completed_tasks", 0)),
+                    assigned_task="",
+                    cooldown_remaining=0,
+                    pause_remaining=0,
+                    stable_for=0,
+                )
 
-                # 1B: Fixed default — matches DEFAULT_PROCESS_CONFIG["automate_process"] = False
-                if not process_cfg.get("automate_process", False):
-                    continue
+            if runtime_config.get("global_pause", False):
+                for key in active_keys:
+                    _runtime_event(key, "paused_global", "global_pause_enabled", now_ts=now)
+            else:
+                for proc in processes:
+                    tty = proc["tty"]
+                    pid = proc["pid"]
+                    atype = proc["type"]
+                    process_key = proc.get("process_key", f"{atype}:{tty}")
+                    process_cfg = get_effective_process_config(runtime_config, process_key)
 
-                # 检查任务配额
-                max_tasks = process_cfg.get("max_tasks", 0)
-                completed_tasks = process_cfg.get("completed_tasks", 0)
-                session_completed_tasks = process_cfg.get("session_completed_tasks", 0)
-
-                # Check for task completion event (to reset assignment)
-                prev_completed = last_completed_counts.get(process_key, -1)
-                if prev_completed != -1 and completed_tasks > prev_completed:
-                    log.info("action=task_completion_detected agent=%s count=%d->%d", atype, prev_completed, completed_tasks)
-                    if process_key in active_task_assignment:
-                        del active_task_assignment[process_key]
-                last_completed_counts[process_key] = completed_tasks
-
-                if max_tasks > 0 and session_completed_tasks >= max_tasks:
-                    # 达到任务上限，停止自动
-                    continue
-
-                if tty in sent_history:
-                    log.debug("action=cooldown_skip agent=%s tty=%s", atype, tty)
-                    continue
-
-                # Manage Task Assignment
-                current_assignment = active_task_assignment.get(process_key)
-                task_types = process_cfg.get("task_types", [])
-                task_weights = process_cfg.get("task_weights", {})
-
-                # Invalidate stale assignment if task_types config changed
-                if current_assignment and task_types and current_assignment not in task_types:
-                    log.info("action=task_assignment_invalidated agent=%s old_task='%s' reason=not_in_current_task_types",
-                             atype, current_assignment)
-                    del active_task_assignment[process_key]
-                    current_assignment = None
-
-                if not current_assignment and task_types:
-                    current_assignment = pick_weighted_task(task_types, task_weights)
-                    if current_assignment:
-                        active_task_assignment[process_key] = current_assignment
-                        log.info("action=task_assigned agent=%s task='%s'", atype, current_assignment)
-
-                # Use assigned task or fallback to None (which allows general behavior)
-                assigned_task = current_assignment
-
-                # 检查是否暂停
-                is_waking_up = False
-                if tty in pause_history:
-                    remaining = int(pause_history[tty] - now)
-                    if remaining > 0:
-                        # 避免刷屏，不记录日志
+                    if not process_cfg.get("automate_process", False):
+                        _runtime_event(process_key, "manual", "automation_disabled", now_ts=now)
                         continue
-                    else:
-                        # 暂停时间结束，进入唤醒检查流程
+
+                    max_tasks = process_cfg.get("max_tasks", 0)
+                    completed_tasks = process_cfg.get("completed_tasks", 0)
+                    session_completed_tasks = process_cfg.get("session_completed_tasks", 0)
+
+                    prev_completed = last_completed_counts.get(process_key, -1)
+                    if prev_completed != -1 and completed_tasks != prev_completed:
+                        log.info(
+                            "action=signal_count_changed agent=%s total=%d->%d",
+                            atype,
+                            prev_completed,
+                            completed_tasks,
+                        )
+                    last_completed_counts[process_key] = completed_tasks
+
+                    if max_tasks > 0 and session_completed_tasks >= max_tasks:
+                        _runtime_event(process_key, "quota_reached", "max_signals_reached", now_ts=now)
+                        continue
+
+                    if tty in sent_history:
+                        remaining = max(0, int(cooldown - (now - sent_history[tty])))
+                        _runtime_event(
+                            process_key,
+                            "cooldown",
+                            "cooldown_skip",
+                            now_ts=now,
+                            cooldown_remaining=remaining,
+                        )
+                        continue
+
+                    task_types = process_cfg.get("task_types", [])
+                    task_weights = process_cfg.get("task_weights", {})
+                    # Re-draw task by weights every dispatch cycle (no sticky assignment).
+                    assigned_task = pick_weighted_task(task_types, task_weights) if task_types else None
+                    if assigned_task:
+                        log.info("action=task_weighted_pick agent=%s task='%s'", atype, assigned_task)
+                    _runtime_mark(process_key, now_ts=now, assigned_task=assigned_task or "")
+
+                    is_waking_up = False
+                    if tty in pause_history:
+                        remaining = int(pause_history[tty] - now)
+                        if remaining > 0:
+                            _runtime_event(
+                                process_key,
+                                "paused",
+                                "pause_wait",
+                                now_ts=now,
+                                pause_remaining=remaining,
+                            )
+                            continue
                         is_waking_up = True
                         log.info("action=pause_ended agent=%s tty=%s", atype, tty)
+                        _runtime_event(process_key, "wakeup_check", "pause_ended", now_ts=now)
 
-                # 只有空闲且需要交互时才 logging (在 is_process_idle 内部已降级忙碌日志)
-                if not is_process_idle(pid, atype):
-                    continue
+                    if not is_process_idle(pid, atype):
+                        _runtime_event(process_key, "busy", "cpu_busy", now_ts=now)
+                        continue
 
-                content = get_terminal_content(tty)
-                if not content or len(content.strip()) < 10:
-                    log.warning("action=terminal_empty agent=%s tty=%s", atype, tty)
-                    continue
+                    content = get_terminal_content(tty)
+                    if not content or len(content.strip()) < 10:
+                        log.warning("action=terminal_empty agent=%s tty=%s", atype, tty)
+                        _runtime_event(process_key, "terminal_error", "terminal_empty", now_ts=now)
+                        continue
 
-                # 跨周期终端稳定性检测
-                content_hash = hash(content[-3000:])
-                prev_hash = _terminal_content_hashes.get(tty)
-                _terminal_content_hashes[tty] = content_hash
+                    content_hash = hash(content[-3000:])
+                    prev_hash = _terminal_content_hashes.get(tty)
+                    _terminal_content_hashes[tty] = content_hash
 
-                if prev_hash is None or content_hash != prev_hash:
-                    _content_stable_since[tty] = time.time()
-                    log.info("action=terminal_content_changed agent=%s tty=%s", atype, tty)
-                    continue
+                    if prev_hash is None or content_hash != prev_hash:
+                        _content_stable_since[tty] = time.time()
+                        log.info("action=terminal_content_changed agent=%s tty=%s", atype, tty)
+                        _runtime_event(process_key, "waiting_stable", "terminal_changed", now_ts=now, stable_for=0)
+                        continue
 
-                stable_duration = time.time() - _content_stable_since.get(tty, time.time())
-                if stable_duration < terminal_stable_min:
-                    log.debug("action=terminal_not_yet_stable agent=%s tty=%s stable=%.0fs need=%ds",
-                              atype, tty, stable_duration, terminal_stable_min)
-                    continue
+                    stable_duration = time.time() - _content_stable_since.get(tty, time.time())
+                    if stable_duration < terminal_stable_min:
+                        log.debug(
+                            "action=terminal_not_yet_stable agent=%s tty=%s stable=%.0fs need=%ds",
+                            atype,
+                            tty,
+                            stable_duration,
+                            terminal_stable_min,
+                        )
+                        _runtime_event(
+                            process_key,
+                            "waiting_stable",
+                            "terminal_not_stable",
+                            now_ts=now,
+                            stable_for=int(stable_duration),
+                        )
+                        continue
 
-                log.info("action=idle_detected agent=%s tty=%s stable_for=%.0fs", atype, tty, stable_duration)
+                    log.info("action=idle_detected agent=%s tty=%s stable_for=%.0fs", atype, tty, stable_duration)
+                    _runtime_event(process_key, "idle", "idle_detected", now_ts=now, stable_for=int(stable_duration))
 
-                # 2B: 更新上下文缓存 (with timestamp)
-                agent_contexts[tty] = {
-                    "type": atype,
-                    "content": content,
-                    "timestamp": time.time(),
-                }
+                    agent_contexts[tty] = {
+                        "type": atype,
+                        "content": content,
+                        "timestamp": time.time(),
+                    }
 
-                # 提取其他伙伴的上下文，支持多个 agent (2B: skip stale entries >5 min)
-                peer_context = None
-                if process_cfg.get("enable_agent_team", True):
-                    peer_context_parts = []
-                    for other_tty, ctx_info in agent_contexts.items():
-                        if other_tty != tty:
+                    peer_context = None
+                    if process_cfg.get("enable_agent_team", True):
+                        peer_context_parts = []
+                        for other_tty, ctx_info in agent_contexts.items():
+                            if other_tty == tty:
+                                continue
                             if now - ctx_info.get("timestamp", 0) > 300:
-                                continue  # skip stale peer context (>5 min)
+                                continue
                             peer_type = ctx_info["type"]
                             peer_content = ctx_info["content"]
-                            peer_context_parts.append(f"--- 另一个 Agent ({peer_type} @ {other_tty}) 的状态 ---\n{peer_content[-1500:]}\n")
-                    peer_context = "\n".join(peer_context_parts) if peer_context_parts else None
+                            peer_context_parts.append(
+                                f"--- 另一个 Agent ({peer_type} @ {other_tty}) 的状态 ---\n{peer_content[-1500:]}\n"
+                            )
+                        peer_context = "\n".join(peer_context_parts) if peer_context_parts else None
 
-                # 准备 override prompt
-                override_prompt_parts = []
-                if is_waking_up and atype == "claude":
-                    override_prompt_parts.append("根据白蚁协议，目前有多少个未完成的任务？如果 Codex 的工作积压仍然很高，请输出 [PAUSE] 以继续等待。")
-                if not process_cfg.get("enable_agent_team", True):
-                    override_prompt_parts.append("当前进程配置关闭了 agent team。不要依赖或等待其他 agent 的协作信息，请单独推进。")
-                if not process_cfg.get("new_chat_on_done", True):
-                    override_prompt_parts.append("当前进程配置禁止输出 /new。任务完成后必须在当前对话继续工作。")
-                override_prompt = "\n".join(override_prompt_parts) if override_prompt_parts else None
+                    override_prompt_parts = []
+                    if is_waking_up and atype == "claude":
+                        override_prompt_parts.append("根据白蚁协议，目前有多少个未完成的任务？如果 Codex 的工作积压仍然很高，请输出 [PAUSE] 以继续等待。")
+                    if not process_cfg.get("enable_agent_team", True):
+                        override_prompt_parts.append("当前进程配置关闭了 agent team。不要依赖或等待其他 agent 的协作信息，请单独推进。")
+                    if not process_cfg.get("new_chat_on_done", True):
+                        override_prompt_parts.append("当前进程配置禁止输出 /new。任务完成后必须在当前对话继续工作。")
+                    override_prompt = "\n".join(override_prompt_parts) if override_prompt_parts else None
 
-                log.info("action=ai_request agent=%s tty=%s wake_up=%s task=%s",
-                         atype, tty, is_waking_up, assigned_task or "General")
+                    log.info("action=ai_request agent=%s tty=%s wake_up=%s task=%s", atype, tty, is_waking_up, assigned_task or "General")
+                    _runtime_event(process_key, "deciding", "ai_request", now_ts=now)
 
-                # "你是自由的" and "白蚁协议" bypass LLM — inject directly
-                if assigned_task == "你是自由的":
-                    decision = YOU_ARE_FREE_PROMPT
-                    log_ai_interaction(atype, content, f"[DIRECT] {decision}")
-                elif assigned_task == "白蚁协议":
-                    decision = "白蚁协议"
-                    log_ai_interaction(atype, content, f"[DIRECT] {decision}")
-                else:
-                    decision = call_claude(atype, content, peer_context, override_prompt, tty=tty, task_types=task_types, assigned_task=assigned_task)
+                    if assigned_task == "你是自由的":
+                        decision = YOU_ARE_FREE_PROMPT
+                        log_ai_interaction(atype, content, f"[DIRECT] {decision}")
+                    elif assigned_task == "白蚁协议":
+                        decision = "白蚁协议"
+                        log_ai_interaction(atype, content, f"[DIRECT] {decision}")
+                    else:
+                        decision = call_claude(
+                            atype,
+                            content,
+                            peer_context,
+                            override_prompt,
+                            tty=tty,
+                            task_types=task_types,
+                            assigned_task=assigned_task,
+                        )
 
-                # 1C: Atomic task count update via read-modify-write under exclusive lock
-                if decision and decision.strip() == "/new":
-                    def _increment_counts(cfg, _pk=process_key):
-                        procs = cfg.setdefault("processes", {})
-                        proc_cfg = procs.setdefault(_pk, {})
-                        proc_cfg["completed_tasks"] = proc_cfg.get("completed_tasks", 0) + 1
-                        proc_cfg["session_completed_tasks"] = proc_cfg.get("session_completed_tasks", 0) + 1
+                    if decision and decision.strip() == "/new" and not process_cfg.get("new_chat_on_done", True):
+                        log.info("action=new_chat_blocked agent=%s tty=%s", atype, tty)
+                        decision = "根据白蚁协议，在当前对话继续推进，不要/new。"
 
-                    fresh = atomic_read_modify_write(_increment_counts, CONFIG_FILE)
-                    fresh_proc = get_effective_process_config(fresh, process_key)
-                    new_count = fresh_proc.get("completed_tasks", 0)
-                    new_session_count = fresh_proc.get("session_completed_tasks", 0)
-                    log.info("action=task_completed agent=%s tty=%s session=%d/%d total=%d",
-                             atype, tty, new_session_count, max_tasks, new_count)
-                    _metrics["tasks_completed"] += 1
-
-                if decision and decision.strip() == "/new" and not process_cfg.get("new_chat_on_done", True):
-                    log.info("action=new_chat_blocked agent=%s tty=%s", atype, tty)
-                    decision = "根据白蚁协议，在当前对话继续推进，不要/new。"
-
-                # 如果是唤醒检查，且AI决定继续暂停
-                if is_waking_up and decision and "[PAUSE]" in decision:
-                    log.info("action=pause_extended agent=%s tty=%s duration=%ds", atype, tty, pause_duration)
-                    pause_history[tty] = time.time() + pause_duration
-                    _metrics["pauses_triggered"] += 1
-                    continue
-
-                # 如果决定恢复（没有输出 PAUSE），则清理 pause_history
-                if is_waking_up and tty in pause_history:
-                    del pause_history[tty]
-
-                if decision:
-                    _metrics["decisions_made"] += 1
-                    # 记录 AI 指令历史
-                    if tty not in ai_decision_history:
-                        ai_decision_history[tty] = deque(maxlen=10)
-                    ai_decision_history[tty].append(decision)
-
-                    if "[PAUSE]" in decision:
-                        log.info("action=pause_started agent=%s tty=%s duration=%ds", atype, tty, pause_duration)
+                    if is_waking_up and decision and "[PAUSE]" in decision:
+                        log.info("action=pause_extended agent=%s tty=%s duration=%ds", atype, tty, pause_duration)
                         pause_history[tty] = time.time() + pause_duration
                         _metrics["pauses_triggered"] += 1
-                        # 仍记录到历史防止立即重试 (虽然 pause_history 已经处理了)
-                        sent_history[tty] = time.time()
-                    else:
-                        log.info("action=ai_decision agent=%s tty=%s decision='%s'", atype, tty, decision.replace('\n', '\\n'))
-                        # 2C: TTY injection retry (up to 3 attempts)
-                        injection_success = False
-                        for inject_attempt in range(3):
-                            if inject_input(tty, decision):
-                                injection_success = True
-                                break
-                            log.warning("action=inject_retry agent=%s tty=%s attempt=%d/3", atype, tty, inject_attempt + 1)
-                            time.sleep(0.5)
-                        if injection_success:
-                            sent_history[tty] = time.time()
-                            _metrics["injections_succeeded"] += 1
-                        else:
-                            log.error("action=inject_failed agent=%s tty=%s", atype, tty)
-                            _metrics["injections_failed"] += 1
-                            # Don't record in sent_history — allow retry on next poll
-                else:
-                    _metrics["decisions_failed"] += 1
-                    log.warning("action=ai_no_decision agent=%s tty=%s", atype, tty)
+                        _runtime_event(
+                            process_key,
+                            "paused",
+                            "pause_extended",
+                            now_ts=now,
+                            pause_remaining=pause_duration,
+                            last_decision=decision[:200],
+                        )
+                        continue
 
+                    if is_waking_up and tty in pause_history:
+                        del pause_history[tty]
+
+                    if decision:
+                        _metrics["decisions_made"] += 1
+                        if tty not in ai_decision_history:
+                            ai_decision_history[tty] = deque(maxlen=10)
+                        ai_decision_history[tty].append(decision)
+
+                        if "[PAUSE]" in decision:
+                            log.info("action=pause_started agent=%s tty=%s duration=%ds", atype, tty, pause_duration)
+                            pause_history[tty] = time.time() + pause_duration
+                            _metrics["pauses_triggered"] += 1
+                            sent_history[tty] = time.time()
+                            _runtime_event(
+                                process_key,
+                                "paused",
+                                "pause_started",
+                                now_ts=now,
+                                pause_remaining=pause_duration,
+                                last_decision=decision[:200],
+                            )
+                        else:
+                            log.info("action=ai_decision agent=%s tty=%s decision='%s'", atype, tty, decision.replace('\n', '\\n'))
+                            injection_success = False
+                            for inject_attempt in range(3):
+                                if inject_input(tty, decision):
+                                    injection_success = True
+                                    break
+                                log.warning("action=inject_retry agent=%s tty=%s attempt=%d/3", atype, tty, inject_attempt + 1)
+                                time.sleep(0.5)
+                            if injection_success:
+                                def _increment_counts(cfg, _pk=process_key):
+                                    procs = cfg.setdefault("processes", {})
+                                    proc_cfg = procs.setdefault(_pk, {})
+                                    proc_cfg["completed_tasks"] = proc_cfg.get("completed_tasks", 0) + 1
+                                    proc_cfg["session_completed_tasks"] = proc_cfg.get("session_completed_tasks", 0) + 1
+
+                                fresh = atomic_read_modify_write(_increment_counts, CONFIG_FILE)
+                                fresh_proc = get_effective_process_config(fresh, process_key)
+                                new_count = fresh_proc.get("completed_tasks", 0)
+                                new_session_count = fresh_proc.get("session_completed_tasks", 0)
+
+                                sent_history[tty] = time.time()
+                                _metrics["injections_succeeded"] += 1
+                                _metrics["signals_sent"] += 1
+                                last_completed_counts[process_key] = new_count
+                                log.info(
+                                    "action=signal_sent agent=%s tty=%s session=%d/%d total=%d",
+                                    atype,
+                                    tty,
+                                    new_session_count,
+                                    max_tasks,
+                                    new_count,
+                                )
+                                _runtime_event(
+                                    process_key,
+                                    "injected",
+                                    "command_sent",
+                                    now_ts=now,
+                                    last_decision=decision[:200],
+                                    completed_tasks=new_count,
+                                    session_completed_tasks=new_session_count,
+                                )
+                            else:
+                                log.error("action=inject_failed agent=%s tty=%s", atype, tty)
+                                _metrics["injections_failed"] += 1
+                                _runtime_event(
+                                    process_key,
+                                    "inject_error",
+                                    "inject_failed",
+                                    now_ts=now,
+                                    last_decision=decision[:200],
+                                )
+                    else:
+                        _metrics["decisions_failed"] += 1
+                        log.warning("action=ai_no_decision agent=%s tty=%s", atype, tty)
+                        _runtime_event(process_key, "decision_error", "ai_no_decision", now_ts=now)
         except Exception as e:
+            loop_error = str(e)
             log.error("主循环异常: %s", e)
 
-        # 4E: Periodic metrics summary (every 100 loops ≈ 17 min at default poll)
         if _metrics["loop_count"] % 100 == 0:
             log.info("action=metrics_summary %s", " ".join(f"{k}={v}" for k, v in _metrics.items()))
 
+        _persist_runtime_snapshot(poll_interval, runtime_config, len(processes), loop_error)
         time.sleep(poll_interval)
 
 if __name__ == "__main__":

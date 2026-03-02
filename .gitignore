@@ -5,3 +5,14 @@ __pycache__/
 termite_process_config.json
 *.lock
 *.tmp
+# Termite Protocol — ephemeral runtime files
+.birth
+.birth.*
+.field-breath
+.pheromone
+.termite.db
+.termite.db-wal
+.termite.db-shm
+.termite-upstream-check
+.termite-upgrade-report
+audit-package-*

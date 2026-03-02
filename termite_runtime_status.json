@@ -1,0 +1,91 @@
+{
+  "daemon": {
+    "pid": 34078,
+    "running": false,
+    "heartbeat_ts": 1772429805.636419,
+    "heartbeat": "2026-03-02T05:36:45Z",
+    "poll_interval": 10,
+    "global_pause": false,
+    "active_process_count": 0,
+    "last_error": "terminated"
+  },
+  "metrics": {
+    "loop_count": 401,
+    "decisions_made": 0,
+    "decisions_failed": 0,
+    "injections_succeeded": 0,
+    "injections_failed": 0,
+    "tasks_completed": 0,
+    "pauses_triggered": 0
+  },
+  "processes": {
+    "claude:ttys011": {
+      "tty": "ttys011",
+      "pid": 99913,
+      "type": "claude",
+      "automate": false,
+      "max_tasks": 0,
+      "completed_tasks": 0,
+      "session_completed_tasks": 0,
+      "assigned_task": "",
+      "cooldown_remaining": 0,
+      "pause_remaining": 0,
+      "stable_for": 0,
+      "updated_at": 1772429802.293244,
+      "status": "manual",
+      "last_event": "automation_disabled",
+      "last_event_ts": 1772429802.293244
+    },
+    "codex:ttys000": {
+      "tty": "ttys000",
+      "pid": 35392,
+      "type": "codex",
+      "automate": false,
+      "max_tasks": 0,
+      "completed_tasks": 0,
+      "session_completed_tasks": 0,
+      "assigned_task": "",
+      "cooldown_remaining": 0,
+      "pause_remaining": 0,
+      "stable_for": 0,
+      "updated_at": 1772429802.293244,
+      "status": "manual",
+      "last_event": "automation_disabled",
+      "last_event_ts": 1772429802.293244
+    },
+    "codex:ttys008": {
+      "tty": "ttys008",
+      "pid": 95668,
+      "type": "codex",
+      "automate": false,
+      "max_tasks": 0,
+      "completed_tasks": 0,
+      "session_completed_tasks": 0,
+      "assigned_task": "",
+      "cooldown_remaining": 0,
+      "pause_remaining": 0,
+      "stable_for": 0,
+      "updated_at": 1772429802.293244,
+      "status": "manual",
+      "last_event": "automation_disabled",
+      "last_event_ts": 1772429802.293244
+    },
+    "claude:ttys003": {
+      "tty": "ttys003",
+      "pid": 66685,
+      "type": "claude",
+      "automate": false,
+      "max_tasks": 0,
+      "completed_tasks": 0,
+      "session_completed_tasks": 0,
+      "assigned_task": "",
+      "cooldown_remaining": 0,
+      "pause_remaining": 0,
+      "stable_for": 0,
+      "updated_at": 1772429802.293244,
+      "status": "manual",
+      "last_event": "automation_disabled",
+      "last_event_ts": 1772429802.293244
+    }
+  }
+}

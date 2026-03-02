@@ -14,6 +14,7 @@ from contextlib import contextmanager
 from typing import Dict, List, Optional, Tuple
 
 CONFIG_FILE = "termite_process_config.json"
+RUNTIME_STATUS_FILE = "termite_runtime_status.json"
 
 DEFAULT_PROCESS_CONFIG = {
     "enable_agent_team": True,
@@ -166,6 +167,29 @@ def load_process_config(path: str = CONFIG_FILE) -> dict:
         return _load_process_config_impl(path)
 
 
+def load_runtime_status(path: str = RUNTIME_STATUS_FILE) -> dict:
+    with _file_lock(path, exclusive=False):
+        if not os.path.exists(path):
+            return {"daemon": {}, "metrics": {}, "processes": {}}
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+        except Exception:
+            return {"daemon": {}, "metrics": {}, "processes": {}}
+        if not isinstance(data, dict):
+            return {"daemon": {}, "metrics": {}, "processes": {}}
+        daemon = data.get("daemon")
+        metrics = data.get("metrics")
+        processes = data.get("processes")
+        if not isinstance(daemon, dict):
+            daemon = {}
+        if not isinstance(metrics, dict):
+            metrics = {}
+        if not isinstance(processes, dict):
+            processes = {}
+        return {"daemon": daemon, "metrics": metrics, "processes": processes}
+
+
 def _save_process_config_impl(config: dict, path: str) -> None:
     """Internal: serialize and write config. Caller must hold lock."""
     serializable = {
@@ -187,6 +211,22 @@ def _save_process_config_impl(config: dict, path: str) -> None:
 def save_process_config(config: dict, path: str = CONFIG_FILE) -> None:
     with _file_lock(path, exclusive=True):
         _save_process_config_impl(config, path)
+
+
+def save_runtime_status(status: dict, path: str = RUNTIME_STATUS_FILE) -> None:
+    serializable = {"daemon": {}, "metrics": {}, "processes": {}}
+    if isinstance(status, dict):
+        daemon = status.get("daemon")
+        metrics = status.get("metrics")
+        processes = status.get("processes")
+        if isinstance(daemon, dict):
+            serializable["daemon"] = daemon
+        if isinstance(metrics, dict):
+            serializable["metrics"] = metrics
+        if isinstance(processes, dict):
+            serializable["processes"] = processes
+    with _file_lock(path, exclusive=True):
+        _atomic_write_json(path, serializable)
 
 
 def atomic_read_modify_write(modifier_fn, path: str = CONFIG_FILE) -> dict:
